@@ -1,8 +1,9 @@
-flask
-flask-cors
+fastapi
+uvicorn
+python-multipart
 sentence-transformers
 groq
 numpy
 PyPDF2
 requests
-dotenv
+python-dotenv

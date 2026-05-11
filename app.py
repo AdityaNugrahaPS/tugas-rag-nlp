@@ -1,8 +1,10 @@
 import os, io, time, uuid, numpy as np
-from typing import List, Dict, Any
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-from sentence_transformers import SentenceTransformer
+from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
 from groq import Groq
@@ -37,12 +39,17 @@ SCORE_THRESHOLD = 0.30       # drop kandidat yg terlalu rendah
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-app = Flask(__name__, static_folder=".", static_url_path="")
-CORS(app)
-
 # Embedding ringan & multilingual
 EMBED_NAME = "intfloat/multilingual-e5-small"
-embedder = SentenceTransformer(EMBED_NAME)
+
+# Lazy-loaded models (hindari crash saat uvicorn --reload)
+_embedder = None
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        from sentence_transformers import SentenceTransformer
+        _embedder = SentenceTransformer(EMBED_NAME)
+    return _embedder
 
 # (Opsional) Reranker kecil yang cepat
 # Diaktifkan hanya jika USE_RERANKER=True
@@ -53,6 +60,22 @@ def get_reranker():
         from sentence_transformers import CrossEncoder
         _ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
     return _ce
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: pre-load embedding model
+    get_embedder()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # In-memory store
 DOCS: List[Dict[str, Any]] = []  # {id, text, meta, emb(np.ndarray)}
@@ -69,7 +92,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return chunks
 
 def embed_texts(texts: List[str]) -> np.ndarray:
-    embs = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+    embs = get_embedder().encode(texts, convert_to_numpy=True, show_progress_bar=False)
     # normalize → cosine = dot
     norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9
     return (embs / norms).astype(np.float32)
@@ -105,22 +128,17 @@ def call_groq(prompt: str, model: str = GROQ_MODEL, temperature: float = TEMPERA
     return completion.choices[0].message.content
 
 # ---------- Web UI Endpoints ----------
-@app.route("/")
+@app.get("/")
 def index():
     """Serve halaman utama"""
-    return send_from_directory(".", "index.html")
-
-@app.route("/<path:path>")
-def serve_static(path):
-    """Serve static files (css, js, images, dll)"""
-    return send_from_directory(".", path)
+    return FileResponse("index.html")
 
 @app.post("/clear")
 def clear_knowledge():
     """Hapus semua dokumen dari knowledge base"""
     count = len(DOCS)
     DOCS.clear()
-    return jsonify({"cleared": count, "total_store": 0})
+    return {"cleared": count, "total_store": 0}
 
 # ---------- API Endpoints ----------
 @app.get("/health")
@@ -130,7 +148,12 @@ def health():
     return {"ok": True, "docs": len(DOCS), "sources": sources}
 
 @app.post("/ingest")
-def ingest():
+async def ingest(
+    source: str = Form("user"),
+    replace: str = Form("false"),
+    text: str = Form(""),
+    file: List[UploadFile] = File(default=[])
+):
     """
     Multipart form:
     - file: PDF (opsional, bisa lebih dari 1)
@@ -139,33 +162,30 @@ def ingest():
     - replace: "true" untuk hapus knowledge base lama (default: false)
     """
     t0 = time.time()
-    source = request.form.get("source", "user")
-    replace = request.form.get("replace", "false").lower() == "true"
+    replace_bool = replace.lower() == "true"
     
     # Clear knowledge base jika replace=true
-    if replace:
+    if replace_bool:
         DOCS.clear()
     
     chunks_all = []
 
     # teks bebas
-    text = request.form.get("text", "").strip()
-    if text:
-        chunks_all += [{"text": ch, "meta": {"source": source}} for ch in chunk_text(text)]
+    text_val = text.strip()
+    if text_val:
+        chunks_all += [{"text": ch, "meta": {"source": source}} for ch in chunk_text(text_val)]
 
     # PDF
-    if "file" in request.files:
-        files = request.files.getlist("file")
-        for f in files:
-            if not f.filename.lower().endswith(".pdf"): continue
-            raw = f.read()
+    for f in file:
+        if f.filename and f.filename.lower().endswith(".pdf"):
+            raw = await f.read()
             txt = extract_pdf_text(raw)
             src = f.filename or source
             chunks = chunk_text(txt)
             chunks_all += [{"text": ch, "meta": {"source": src}} for ch in chunks]
 
     if not chunks_all:
-        return jsonify({"error": "No content provided"}), 400
+        raise HTTPException(status_code=400, detail="No content provided")
 
     embs = embed_texts([c["text"] for c in chunks_all])
     for c, e in zip(chunks_all, embs):
@@ -174,27 +194,54 @@ def ingest():
     return {
         "ingested_chunks": len(chunks_all),
         "total_store": len(DOCS),
-        "replaced": replace,
+        "replaced": replace_bool,
         "latency_ms": round((time.time() - t0) * 1000, 1)
     }
 
+class ChatRequest(BaseModel):
+    query: str
+
 @app.post("/chat")
-def chat():
+def chat(req: ChatRequest):
     """
     JSON:
     { "query": "..." }
+    Jika knowledge base kosong, jawab langsung via LLM tanpa RAG.
     """
     if not groq_client.api_key:
-        return jsonify({"error": "GROQ_API_KEY not set"}), 400
-    if not DOCS:
-        return jsonify({"error": "Knowledge base empty. Ingest first."}), 400
+        raise HTTPException(status_code=400, detail="GROQ_API_KEY not set")
 
-    data = request.get_json(force=True)
-    query = (data.get("query") or "").strip()
+    query = (req.query or "").strip()
     if not query:
-        return jsonify({"error": "Missing query"}), 400
+        raise HTTPException(status_code=400, detail="Missing query")
 
     t0 = time.time()
+
+    # Jika knowledge base kosong, langsung jawab via LLM (tanpa RAG)
+    if not DOCS:
+        t1 = time.time()
+        try:
+            completion = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a helpful, concise assistant."},
+                    {"role": "user", "content": query}
+                ],
+                temperature=TEMPERATURE,
+                max_completion_tokens=512
+            )
+            answer = completion.choices[0].message.content
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"LLM call failed: {e}")
+        gen_ms = round((time.time() - t1) * 1000, 1)
+        return {
+            "answer": answer,
+            "contexts": [],
+            "mode": "general",
+            "metrics": {"retrieval_ms": 0, "generation_ms": gen_ms}
+        }
+
+    # Mode RAG: ada dokumen di knowledge base
     q_vec = embed_texts([query])[0]
 
     M = np.stack([d["embedding"] for d in DOCS], axis=0)
@@ -230,14 +277,23 @@ def chat():
     try:
         answer = call_groq(prompt, model=GROQ_MODEL, temperature=TEMPERATURE, max_tokens=512)
     except Exception as e:
-        return jsonify({"error": f"LLM call failed: {e}"}), 500
+        raise HTTPException(status_code=500, detail=f"LLM call failed: {e}")
     gen_ms = round((time.time() - t1) * 1000, 1)
 
-    return jsonify({
+    return {
         "answer": answer,
         "contexts": [{"text": c["text"], "meta": c["meta"], "score": round(c.get('_rerank', c['_score']), 4)} for c in cands],
+        "mode": "rag",
         "metrics": {"retrieval_ms": retrieval_ms, "generation_ms": gen_ms}
-    })
+    }
+
+@app.get("/{path:path}")
+def serve_static(path: str):
+    """Serve static files (css, js, images, dll)"""
+    if os.path.exists(path) and os.path.isfile(path):
+        return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Not Found")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 7860)), debug=True)
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 7860)), reload=True)
